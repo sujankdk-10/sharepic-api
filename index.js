@@ -80,17 +80,18 @@ function ratingDocId(photoId, author) {
   return `${photoId}::${safeAuthor}`;
 }
 
+// IMPORTANT: avoid using the word "value" anywhere in Cosmos SQL text.
+// Use c["value"] and alias "ratingValue".
 async function getRatingsSummary(ratingsContainer, photoId) {
-  // ✅ FIX: "value" can trigger Cosmos SQL parse issues; use c["value"]
   const { resources } = await ratingsContainer.items
     .query({
-      query: 'SELECT c["value"] AS value FROM c WHERE c.photoId = @photoId',
+      query: 'SELECT c["value"] AS ratingValue FROM c WHERE c.photoId = @photoId',
       parameters: [{ name: "@photoId", value: photoId }],
     })
     .fetchAll();
 
   const values = (resources || [])
-    .map((r) => Number(r.value))
+    .map((r) => Number(r.ratingValue))
     .filter((v) => Number.isFinite(v));
 
   const count = values.length;
@@ -255,8 +256,6 @@ app.post("/api/photos/:photoId/comments", async (req, res) => {
 });
 
 // ---- Ratings (partition key /photoId) ----
-
-// GET rating summary
 app.get("/api/photos/:photoId/ratings", async (req, res) => {
   try {
     const cosmos = await verifyAndGetCosmosContainers();
@@ -270,16 +269,15 @@ app.get("/api/photos/:photoId/ratings", async (req, res) => {
   }
 });
 
-// POST rating (1 per author per photo via upsert)
 app.post("/api/photos/:photoId/ratings", async (req, res) => {
   try {
     const cosmos = await verifyAndGetCosmosContainers();
     const { photoId } = req.params;
 
     const author = normalizeAuthor(req.body.author);
-    const value = Number(req.body.value);
+    const rating = Number(req.body.value);
 
-    if (!Number.isInteger(value) || value < 1 || value > 5) {
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
       return res.status(400).json({ message: "Rating value must be an integer 1-5." });
     }
 
@@ -287,7 +285,7 @@ app.post("/api/photos/:photoId/ratings", async (req, res) => {
       id: ratingDocId(photoId, author),
       photoId,
       author,
-      value,
+      value: rating, // stored as "value" in the document, that's fine
       createdAt: new Date().toISOString(),
     };
 
