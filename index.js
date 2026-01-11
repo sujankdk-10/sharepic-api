@@ -2,97 +2,66 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const { BlobServiceClient } = require("@azure/storage-blob");
-const { CosmosClient } = require("@azure/cosmos");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
+app.use(cors());
 app.use(express.json());
 
-// ---------- MULTER (memory upload) ----------
+// Multer setup (in-memory storage)
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ---------- AZURE BLOB ----------
-const blobServiceClient = BlobServiceClient.fromConnectionString(
-  process.env.AZURE_STORAGE_CONNECTION_STRING
-);
-const containerClient = blobServiceClient.getContainerClient(
-  process.env.BLOB_CONTAINER_NAME
-);
+// Azure Blob setup
+const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
+const BLOB_CONTAINER_NAME = process.env.BLOB_CONTAINER_NAME || "photos";
 
-// ---------- COSMOS ----------
-const cosmosClient = new CosmosClient({
-  endpoint: process.env.COSMOS_ENDPOINT,
-  key: process.env.COSMOS_KEY
-});
-const database = cosmosClient.database(process.env.COSMOS_DB_NAME);
-const photosContainer = database.container(process.env.COSMOS_CONTAINER);
+const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
+const containerClient = blobServiceClient.getContainerClient(BLOB_CONTAINER_NAME);
 
-// ---------- HEALTH ----------
-app.get("/", (req, res) => {
-  res.send("SharePic API is running");
+// Health check
+app.get("/", (req, res) => res.send("SharePic API is running"));
+
+// GET photos (mock)
+app.get("/api/photos", (req, res) => {
+  console.log("GET /api/photos hit!");
+  res.json([{ id: 1, title: "Sample Photo", url: "https://via.placeholder.com/150" }]);
 });
 
-// ---------- GET ALL PHOTOS ----------
-app.get("/api/photos", async (req, res) => {
-  try {
-    const { resources } = await photosContainer.items
-      .query("SELECT * FROM c ORDER BY c.createdAt DESC")
-      .fetchAll();
-
-    res.json(resources);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch photos" });
-  }
-});
-
-// ---------- POST PHOTO (REAL UPLOAD) ----------
+// POST photo (upload file to Azure Blob)
 app.post("/api/photos", upload.single("file"), async (req, res) => {
   try {
     if (!req.file || !req.body.title) {
-      return res.status(400).json({ error: "Title and file required" });
+      return res.status(400).json({ error: "File and title are required" });
     }
 
-    const id = uuidv4();
-    const blobName = `${id}-${req.file.originalname}`;
+    const blobName = `${uuidv4()}-${req.file.originalname}`;
     const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
     await blockBlobClient.uploadData(req.file.buffer, {
-      blobHTTPHeaders: { blobContentType: req.file.mimetype }
+      blobHTTPHeaders: { blobContentType: req.file.mimetype },
     });
 
     const imageUrl = blockBlobClient.url;
+    console.log("Upload success:", imageUrl);
 
-    const photoDoc = {
-      id,
-      title: req.body.title,
-      imageUrl,
-      createdAt: new Date().toISOString()
-    };
-
-    await photosContainer.items.create(photoDoc);
-
-    res.json({
-      message: "Upload successful",
-      imageUrl
-    });
+    res.json({ message: "Upload successful", imageUrl, title: req.body.title });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Upload failed" });
+    res.status(500).json({ error: "Upload failed", details: err.message });
   }
 });
 
-// ---------- COMMENTS ----------
-app.post("/api/photos/:id/comments", async (req, res) => {
-  res.json({ message: "Comment endpoint ready" });
+// POST comment
+app.post("/api/photos/:id/comments", (req, res) => {
+  console.log(`POST /api/photos/${req.params.id}/comments hit! Body:`, req.body);
+  res.json({ message: `Comment added for photo ${req.params.id}` });
 });
 
-// ---------- RATING ----------
-app.post("/api/photos/:id/rating", async (req, res) => {
-  res.json({ message: "Rating endpoint ready" });
+// POST rating
+app.post("/api/photos/:id/rating", (req, res) => {
+  console.log(`POST /api/photos/${req.params.id}/rating hit! Body:`, req.body);
+  res.json({ message: `Rating added for photo ${req.params.id}` });
 });
 
-// ---------- START ----------
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
