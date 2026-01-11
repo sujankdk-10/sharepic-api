@@ -224,17 +224,21 @@ app.post("/api/photos/:photoId/ratings", async (req, res) => {
     const photoId = req.params.photoId;
 
     const author = (req.body.author || "anonymous").trim();
-    const value = Number(req.body.value);
+    const ratingValue = Number(req.body.value); // frontend sends { value: 1..5 }
 
-    if (!Number.isFinite(value) || value < 1 || value > 5) {
+    if (!Number.isFinite(ratingValue) || ratingValue < 1 || ratingValue > 5) {
       return res.status(400).json({ message: "Rating value must be 1-5" });
     }
 
+    // ✅ Write BOTH fields:
+    // - ratingValue (safe going forward)
+    // - value (backward compatibility with your existing data)
     const doc = {
       id: uuidv4(),
       photoId,
       author,
-      value,
+      ratingValue,
+      value: ratingValue,
       createdAt: new Date().toISOString(),
     };
 
@@ -251,23 +255,25 @@ app.get("/api/photos/:photoId/ratings", async (req, res) => {
     const { ratings } = getCosmos();
     const photoId = req.params.photoId;
 
-    // ✅ FIX: "value" can break Cosmos SQL parsing. Use bracket notation.
+    // ✅ Use bracket notation and support BOTH fields.
+    // This avoids Cosmos SQL errors around "value" and keeps old ratings.
     const query = {
-      query: 'SELECT c["value"] AS value FROM c WHERE c.photoId = @photoId',
+      query:
+        'SELECT c["ratingValue"] AS ratingValue, c["value"] AS value FROM c WHERE c.photoId = @photoId',
       parameters: [{ name: "@photoId", value: photoId }],
     };
 
     const { resources } = await ratings.items.query(query).fetchAll();
 
     const values = (resources || [])
-      .map((r) => Number(r.value))
-      .filter((n) => Number.isFinite(n));
+      .map((r) => Number(r.ratingValue ?? r.value))
+      .filter((n) => Number.isFinite(n) && n >= 1 && n <= 5);
 
     const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
     let sum = 0;
 
     for (const v of values) {
-      if (v >= 1 && v <= 5) distribution[v] += 1;
+      distribution[v] += 1;
       sum += v;
     }
 
