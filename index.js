@@ -13,15 +13,21 @@ const PORT = process.env.PORT || 8080;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
 const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
-const BLOB_CONTAINER_NAME = process.env.BLOB_CONTAINER_NAME || process.env.PHOTOS_CONTAINER || "photos";
+const BLOB_CONTAINER_NAME =
+  process.env.BLOB_CONTAINER_NAME || process.env.PHOTOS_CONTAINER || "photos";
 
 const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
 const COSMOS_KEY = process.env.COSMOS_KEY;
 const COSMOS_DB_NAME = process.env.COSMOS_DB_NAME;
+
+// Photos container envs you already use
 const COSMOS_PHOTOS_CONTAINER = process.env.COSMOS_CONTAINER || "photos";
 const COSMOS_COMMENTS_CONTAINER = process.env.COSMOS_COMMENT_CONTAINER || "comments";
+
+// Ratings container env (make sure this exists in App Service settings)
 const COSMOS_RATINGS_CONTAINER = process.env.COSMOS_RATINGS_CONTAINER || "ratings";
 
+// Creator gate
 const CREATOR_UPLOAD_KEY = process.env.CREATOR_UPLOAD_KEY || "";
 
 // ---- Middleware ----
@@ -38,9 +44,13 @@ app.use(
 // Multer in-memory
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ---- Cosmos client ----
+// ---- Cosmos helpers ----
+function cosmosEnabled() {
+  return !!(COSMOS_ENDPOINT && COSMOS_KEY && COSMOS_DB_NAME);
+}
+
 function getCosmos() {
-  if (!COSMOS_ENDPOINT || !COSMOS_KEY || !COSMOS_DB_NAME) {
+  if (!cosmosEnabled()) {
     throw new Error("Cosmos env vars not configured (COSMOS_ENDPOINT/COSMOS_KEY/COSMOS_DB_NAME).");
   }
   const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
@@ -56,11 +66,9 @@ function getCosmos() {
 
 // ---- Creator gate ----
 function requireCreatorKey(req, res, next) {
-  // If key is not set on server, reject (safer, avoids accidentally open uploads)
   if (!CREATOR_UPLOAD_KEY) {
     return res.status(500).json({ message: "CREATOR_UPLOAD_KEY is not configured on the server." });
   }
-
   const provided = req.header("x-creator-key") || "";
   if (provided !== CREATOR_UPLOAD_KEY) {
     return res.status(401).json({ message: "Unauthorized: invalid creator key." });
@@ -68,7 +76,7 @@ function requireCreatorKey(req, res, next) {
   next();
 }
 
-// ---- Health / Debug (safe) ----
+// ---- Health (now checks DB + containers) ----
 app.get("/api/health", async (req, res) => {
   const info = {
     ok: true,
@@ -76,6 +84,7 @@ app.get("/api/health", async (req, res) => {
     corsOrigin: CORS_ORIGIN,
     hasStorageConn: !!AZURE_STORAGE_CONNECTION_STRING,
     blobContainer: BLOB_CONTAINER_NAME,
+    hasCosmos: cosmosEnabled(),
     cosmosDb: COSMOS_DB_NAME,
     cosmosPhotosContainer: COSMOS_PHOTOS_CONTAINER,
     cosmosCommentsContainer: COSMOS_COMMENTS_CONTAINER,
@@ -83,11 +92,20 @@ app.get("/api/health", async (req, res) => {
     hasCreatorKey: !!CREATOR_UPLOAD_KEY,
   };
 
-  // quick cosmos read check (optional)
+  if (!cosmosEnabled()) {
+    info.cosmosStatus = "NOT CONFIGURED";
+    return res.json(info);
+  }
+
   try {
-    const { db } = getCosmos();
+    const { db, photos, comments, ratings } = getCosmos();
+
     await db.read();
-    info.cosmosStatus = "OK (DB readable)";
+    await photos.read();     // <-- verifies container exists
+    await comments.read();   // <-- verifies container exists
+    await ratings.read();    // <-- verifies container exists
+
+    info.cosmosStatus = "OK (DB + containers readable)";
   } catch (e) {
     info.cosmosStatus = "NOT OK: " + (e?.message || String(e));
   }
@@ -95,12 +113,11 @@ app.get("/api/health", async (req, res) => {
   res.json(info);
 });
 
-// ---- GET photos (consumer gallery) ----
+// ---- GET photos ----
 app.get("/api/photos", async (req, res) => {
   try {
     const { photos } = getCosmos();
 
-    // Return only your useful fields (don’t leak Cosmos internal fields)
     const query = {
       query:
         "SELECT c.id, c.imageUrl, c.blobName, c.title, c.caption, c.location, c.people, c.createdAt FROM c ORDER BY c.createdAt DESC",
@@ -110,75 +127,57 @@ app.get("/api/photos", async (req, res) => {
     res.json(resources || []);
   } catch (err) {
     console.error("GET /api/photos ERROR:", err);
-    res.status(500).json({ message: "Failed to fetch photos" });
+    res.status(500).json({ message: "Failed to fetch photos", detail: err?.message || String(err) });
   }
 });
 
 // ---- POST upload photo (creator only) ----
-app.post(
-  "/api/photos",
-  requireCreatorKey,
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ message: "No image received" });
-      }
-
-      if (!AZURE_STORAGE_CONNECTION_STRING) {
-        return res.status(500).json({ message: "AZURE_STORAGE_CONNECTION_STRING not configured" });
-      }
-
-      const blobServiceClient = BlobServiceClient.fromConnectionString(
-        AZURE_STORAGE_CONNECTION_STRING
-      );
-      const containerClient = blobServiceClient.getContainerClient(BLOB_CONTAINER_NAME);
-
-      // Ensure container exists (optional safety)
-      await containerClient.createIfNotExists({ access: "container" });
-
-      const blobName = `${uuidv4()}-${req.file.originalname}`;
-      const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-
-      await blockBlobClient.uploadData(req.file.buffer, {
-        blobHTTPHeaders: { blobContentType: req.file.mimetype },
-      });
-
-      const imageUrl = blockBlobClient.url;
-
-      // Metadata
-      const title = (req.body.title || "").trim();
-      const caption = (req.body.caption || "").trim();
-      const location = (req.body.location || "").trim();
-      const peopleRaw = (req.body.people || "").trim();
-      const people = peopleRaw
-        ? peopleRaw.split(",").map((p) => p.trim()).filter(Boolean)
-        : [];
-
-      const photoDoc = {
-        id: uuidv4(),
-        imageUrl,
-        blobName,
-        title,
-        caption,
-        location,
-        people,
-        createdAt: new Date().toISOString(),
-      };
-
-      const { photos } = getCosmos();
-      await photos.items.create(photoDoc);
-
-      res.json({
-        message: "Upload successful",
-        photo: photoDoc,
-      });
-    } catch (err) {
-      console.error("UPLOAD ERROR:", err);
-      res.status(500).json({ message: "Upload failed" });
+app.post("/api/photos", requireCreatorKey, upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No image received" });
+    if (!AZURE_STORAGE_CONNECTION_STRING) {
+      return res.status(500).json({ message: "AZURE_STORAGE_CONNECTION_STRING not configured" });
     }
+
+    const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
+    const containerClient = blobServiceClient.getContainerClient(BLOB_CONTAINER_NAME);
+    await containerClient.createIfNotExists({ access: "container" });
+
+    const blobName = `${uuidv4()}-${req.file.originalname}`;
+    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+
+    await blockBlobClient.uploadData(req.file.buffer, {
+      blobHTTPHeaders: { blobContentType: req.file.mimetype },
+    });
+
+    const imageUrl = blockBlobClient.url;
+
+    const title = (req.body.title || "").trim();
+    const caption = (req.body.caption || "").trim();
+    const location = (req.body.location || "").trim();
+    const peopleRaw = (req.body.people || "").trim();
+    const people = peopleRaw ? peopleRaw.split(",").map(p => p.trim()).filter(Boolean) : [];
+
+    const photoDoc = {
+      id: uuidv4(),
+      imageUrl,
+      blobName,
+      title,
+      caption,
+      location,
+      people,
+      createdAt: new Date().toISOString(),
+    };
+
+    const { photos } = getCosmos();
+    await photos.items.create(photoDoc);
+
+    res.json({ message: "Upload successful", photo: photoDoc });
+  } catch (err) {
+    console.error("UPLOAD ERROR:", err);
+    res.status(500).json({ message: "Upload failed", detail: err?.message || String(err) });
   }
-);
+});
 
 // ---- COMMENTS ----
 app.get("/api/photos/:photoId/comments", async (req, res) => {
@@ -196,7 +195,7 @@ app.get("/api/photos/:photoId/comments", async (req, res) => {
     res.json(resources || []);
   } catch (err) {
     console.error("GET comments ERROR:", err);
-    res.status(500).json({ message: "Failed to fetch comments" });
+    res.status(500).json({ message: "Failed to fetch comments", detail: err?.message || String(err) });
   }
 });
 
@@ -221,7 +220,7 @@ app.post("/api/photos/:photoId/comments", async (req, res) => {
     res.json({ ok: true, comment: doc });
   } catch (err) {
     console.error("POST comment ERROR:", err);
-    res.status(500).json({ message: "Failed to post comment" });
+    res.status(500).json({ message: "Failed to post comment", detail: err?.message || String(err) });
   }
 });
 
@@ -250,7 +249,7 @@ app.post("/api/photos/:photoId/ratings", async (req, res) => {
     res.json({ ok: true, rating: doc });
   } catch (err) {
     console.error("POST rating ERROR:", err);
-    res.status(500).json({ message: "Failed to save rating" });
+    res.status(500).json({ message: "Failed to save rating", detail: err?.message || String(err) });
   }
 });
 
@@ -265,7 +264,9 @@ app.get("/api/photos/:photoId/ratings", async (req, res) => {
     };
 
     const { resources } = await ratings.items.query(query).fetchAll();
-    const values = (resources || []).map((r) => Number(r.value)).filter((n) => Number.isFinite(n));
+    const values = (resources || [])
+      .map((r) => Number(r.value))
+      .filter((n) => Number.isFinite(n));
 
     const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
     let sum = 0;
@@ -281,7 +282,8 @@ app.get("/api/photos/:photoId/ratings", async (req, res) => {
     res.json({ photoId, average, count, distribution });
   } catch (err) {
     console.error("GET ratings ERROR:", err);
-    res.status(500).json({ message: "Failed to fetch ratings" });
+    // return the REAL error so your frontend shows it
+    res.status(500).json({ message: "Failed to fetch ratings", detail: err?.message || String(err) });
   }
 });
 
