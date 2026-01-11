@@ -1,4 +1,3 @@
-// index.js
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
@@ -7,201 +6,239 @@ const { CosmosClient } = require("@azure/cosmos");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
-const PORT = process.env.PORT || 8080;
 
-// ---- Config (env) ----
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
-const BLOB_CONTAINER_NAME =
-  process.env.BLOB_CONTAINER_NAME || process.env.PHOTOS_CONTAINER || "photos";
-
-const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
-const COSMOS_KEY = process.env.COSMOS_KEY;
-const COSMOS_DB_NAME = process.env.COSMOS_DB_NAME;
-
-const COSMOS_PHOTOS_CONTAINER = process.env.COSMOS_CONTAINER || "photos";
-const COSMOS_COMMENTS_CONTAINER = process.env.COSMOS_COMMENT_CONTAINER || "comments";
-const COSMOS_RATINGS_CONTAINER = process.env.COSMOS_RATINGS_CONTAINER || "ratings";
-
-const CREATOR_UPLOAD_KEY = process.env.CREATOR_UPLOAD_KEY || "";
-
-// ---- Middleware ----
-app.use(express.json({ limit: "2mb" }));
-
-app.use(
-  cors({
-    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-creator-key"],
-  })
-);
+// ---- middleware ----
+const corsOrigin = process.env.CORS_ORIGIN || "*";
+app.use(cors({ origin: corsOrigin }));
+app.use(express.json());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ---- Cosmos helpers ----
-function cosmosEnabled() {
-  return !!(COSMOS_ENDPOINT && COSMOS_KEY && COSMOS_DB_NAME);
+// ---- helpers ----
+function getBlobConnectionString() {
+  return process.env.AZURE_STORAGE_CONNECTION_STRING;
 }
 
-function getCosmos() {
-  if (!cosmosEnabled()) {
-    throw new Error("Cosmos env vars not configured (COSMOS_ENDPOINT/COSMOS_KEY/COSMOS_DB_NAME).");
-  }
-  const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, key: COSMOS_KEY });
-  const db = client.database(COSMOS_DB_NAME);
+function getBlobContainerName() {
+  return process.env.BLOB_CONTAINER_NAME || process.env.PHOTOS_CONTAINER;
+}
+
+function getCosmosConfig() {
   return {
-    client,
-    db,
-    photos: db.container(COSMOS_PHOTOS_CONTAINER),
-    comments: db.container(COSMOS_COMMENTS_CONTAINER),
-    ratings: db.container(COSMOS_RATINGS_CONTAINER),
+    endpoint: process.env.COSMOS_ENDPOINT,
+    key: process.env.COSMOS_KEY,
+    dbName: process.env.COSMOS_DB_NAME,
+    photosContainerName: process.env.COSMOS_CONTAINER, // photos
+    commentsContainerName: process.env.COSMOS_COMMENT_CONTAINER, // comments
+    ratingsContainerName: process.env.COSMOS_RATINGS_CONTAINER, // ratings
   };
 }
 
-// ---- Creator gate ----
-function requireCreatorKey(req, res, next) {
-  if (!CREATOR_UPLOAD_KEY) {
-    return res.status(500).json({ message: "CREATOR_UPLOAD_KEY is not configured on the server." });
+async function verifyAndGetCosmosContainers() {
+  const cfg = getCosmosConfig();
+
+  if (!cfg.endpoint || !cfg.key || !cfg.dbName) {
+    throw new Error("Cosmos missing: COSMOS_ENDPOINT / COSMOS_KEY / COSMOS_DB_NAME");
   }
-  const provided = req.header("x-creator-key") || "";
-  if (provided !== CREATOR_UPLOAD_KEY) {
-    return res.status(401).json({ message: "Unauthorized: invalid creator key." });
-  }
-  next();
+  if (!cfg.photosContainerName) throw new Error("Cosmos missing: COSMOS_CONTAINER (expected 'photos')");
+  if (!cfg.commentsContainerName) throw new Error("Cosmos missing: COSMOS_COMMENT_CONTAINER (expected 'comments')");
+  if (!cfg.ratingsContainerName) throw new Error("Cosmos missing: COSMOS_RATINGS_CONTAINER (expected 'ratings')");
+
+  const client = new CosmosClient({ endpoint: cfg.endpoint, key: cfg.key });
+  const db = client.database(cfg.dbName);
+
+  await db.read().catch(() => {
+    throw new Error(
+      `Cosmos database '${cfg.dbName}' not found. Check COSMOS_DB_NAME (must be DB name from Data Explorer).`
+    );
+  });
+
+  const photos = db.container(cfg.photosContainerName);
+  const comments = db.container(cfg.commentsContainerName);
+  const ratings = db.container(cfg.ratingsContainerName);
+
+  await photos.read().catch(() => {
+    throw new Error(`Cosmos container '${cfg.photosContainerName}' not found in DB '${cfg.dbName}'.`);
+  });
+  await comments.read().catch(() => {
+    throw new Error(`Cosmos container '${cfg.commentsContainerName}' not found in DB '${cfg.dbName}'.`);
+  });
+  await ratings.read().catch(() => {
+    throw new Error(`Cosmos container '${cfg.ratingsContainerName}' not found in DB '${cfg.dbName}'.`);
+  });
+
+  return { photos, comments, ratings };
 }
 
-// ---- Health (checks DB + containers) ----
+function normalizeAuthor(author) {
+  const a = String(author || "anonymous").trim();
+  return a.replace(/\s+/g, " ").slice(0, 40) || "anonymous";
+}
+
+function ratingDocId(photoId, author) {
+  const safeAuthor = normalizeAuthor(author).replace(/[^a-zA-Z0-9._-]/g, "_");
+  return `${photoId}::${safeAuthor}`;
+}
+
+// IMPORTANT: avoid using the word "value" anywhere in Cosmos SQL text.
+// Use c["value"] and alias "ratingValue".
+async function getRatingsSummary(ratingsContainer, photoId) {
+  const { resources } = await ratingsContainer.items
+    .query({
+      query: 'SELECT c["value"] AS ratingValue FROM c WHERE c.photoId = @photoId',
+      parameters: [{ name: "@photoId", value: photoId }],
+    })
+    .fetchAll();
+
+  const values = (resources || [])
+    .map((r) => Number(r.ratingValue))
+    .filter((v) => Number.isFinite(v));
+
+  const count = values.length;
+  const sum = values.reduce((a, b) => a + b, 0);
+  const average = count ? sum / count : 0;
+
+  const dist = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  values.forEach((v) => {
+    const vv = Math.max(1, Math.min(5, Math.round(v)));
+    dist[vv] = (dist[vv] || 0) + 1;
+  });
+
+  return { photoId, average, count, distribution: dist };
+}
+
+// ---- Health ----
 app.get("/api/health", async (req, res) => {
-  const info = {
+  const cfg = getCosmosConfig();
+  const base = {
     ok: true,
     time: new Date().toISOString(),
-    corsOrigin: CORS_ORIGIN,
-    hasStorageConn: !!AZURE_STORAGE_CONNECTION_STRING,
-    blobContainer: BLOB_CONTAINER_NAME,
-    hasCosmos: cosmosEnabled(),
-    cosmosDb: COSMOS_DB_NAME,
-    cosmosPhotosContainer: COSMOS_PHOTOS_CONTAINER,
-    cosmosCommentsContainer: COSMOS_COMMENTS_CONTAINER,
-    cosmosRatingsContainer: COSMOS_RATINGS_CONTAINER,
-    hasCreatorKey: !!CREATOR_UPLOAD_KEY,
+    corsOrigin,
+    hasStorageConn: !!getBlobConnectionString(),
+    blobContainer: getBlobContainerName() || null,
+    cosmosDb: cfg.dbName || null,
+    cosmosPhotosContainer: cfg.photosContainerName || null,
+    cosmosCommentsContainer: cfg.commentsContainerName || null,
+    cosmosRatingsContainer: cfg.ratingsContainerName || null,
   };
 
-  if (!cosmosEnabled()) {
-    info.cosmosStatus = "NOT CONFIGURED";
-    return res.json(info);
-  }
-
   try {
-    const { db, photos, comments, ratings } = getCosmos();
-    await db.read();
-    await photos.read();
-    await comments.read();
-    await ratings.read();
-    info.cosmosStatus = "OK (DB + containers readable)";
+    await verifyAndGetCosmosContainers();
+    res.json({ ...base, cosmosStatus: "OK (DB + containers readable)" });
   } catch (e) {
-    info.cosmosStatus = "NOT OK: " + (e?.message || String(e));
+    res.json({ ...base, cosmosStatus: "NOT OK", cosmosError: e.message });
   }
-
-  res.json(info);
 });
 
-// ---- GET photos ----
+// ---- Photos ----
 app.get("/api/photos", async (req, res) => {
   try {
-    const { photos } = getCosmos();
-
-    const query = {
-      query:
-        "SELECT c.id, c.imageUrl, c.blobName, c.title, c.caption, c.location, c.people, c.createdAt FROM c ORDER BY c.createdAt DESC",
-    };
-
-    const { resources } = await photos.items.query(query).fetchAll();
-    res.json(resources || []);
+    const cosmos = await verifyAndGetCosmosContainers();
+    const { resources } = await cosmos.photos.items
+      .query({ query: "SELECT * FROM c ORDER BY c.createdAt DESC" })
+      .fetchAll();
+    res.json(resources);
   } catch (err) {
-    console.error("GET /api/photos ERROR:", err);
-    res.status(500).json({ message: "Failed to fetch photos", detail: err?.message || String(err) });
+    console.error("LIST PHOTOS ERROR:", err);
+    res.status(500).json({ message: err.message || "Failed to list photos" });
   }
 });
 
-// ---- POST upload photo (creator only) ----
-app.post("/api/photos", requireCreatorKey, upload.single("image"), async (req, res) => {
+app.post("/api/photos", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "No image received" });
-    if (!AZURE_STORAGE_CONNECTION_STRING) {
-      return res.status(500).json({ message: "AZURE_STORAGE_CONNECTION_STRING not configured" });
+    if (!req.file) {
+      return res.status(400).json({
+        message: "No image received. Frontend must send FormData field name 'image'.",
+      });
     }
 
-    const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
-    const containerClient = blobServiceClient.getContainerClient(BLOB_CONTAINER_NAME);
-    await containerClient.createIfNotExists({ access: "container" });
+    const conn = getBlobConnectionString();
+    if (!conn) {
+      return res.status(500).json({
+        message: "AZURE_STORAGE_CONNECTION_STRING missing in App Service settings.",
+      });
+    }
 
-    const blobName = `${uuidv4()}-${req.file.originalname}`;
+    const containerName = getBlobContainerName();
+    if (!containerName) {
+      return res.status(500).json({
+        message: "Blob container missing. Set BLOB_CONTAINER_NAME (recommended).",
+      });
+    }
+
+    const blobServiceClient = BlobServiceClient.fromConnectionString(conn);
+    const containerClient = blobServiceClient.getContainerClient(containerName);
+
+    const containerExists = await containerClient.exists();
+    if (!containerExists) {
+      return res.status(500).json({
+        message: `Blob container '${containerName}' does not exist or cannot be accessed.`,
+      });
+    }
+
+    const safeOriginalName = req.file.originalname.replace(/[^\w.\-]/g, "_");
+    const blobName = `${uuidv4()}-${safeOriginalName}`;
     const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
     await blockBlobClient.uploadData(req.file.buffer, {
       blobHTTPHeaders: { blobContentType: req.file.mimetype },
     });
 
-    const imageUrl = blockBlobClient.url;
-
-    const title = (req.body.title || "").trim();
-    const caption = (req.body.caption || "").trim();
-    const location = (req.body.location || "").trim();
-    const peopleRaw = (req.body.people || "").trim();
-    const people = peopleRaw ? peopleRaw.split(",").map(p => p.trim()).filter(Boolean) : [];
+    const cosmos = await verifyAndGetCosmosContainers();
 
     const photoDoc = {
-      id: uuidv4(),
-      imageUrl,
+      id: uuidv4(), // partition key /id
+      imageUrl: blockBlobClient.url,
       blobName,
-      title,
-      caption,
-      location,
-      people,
+      title: (req.body.title || "").trim(),
+      caption: (req.body.caption || "").trim(),
+      location: (req.body.location || "").trim(),
+      people: ((req.body.people || "").trim())
+        ? req.body.people.split(",").map((s) => s.trim()).filter(Boolean)
+        : [],
       createdAt: new Date().toISOString(),
     };
 
-    const { photos } = getCosmos();
-    await photos.items.create(photoDoc);
+    await cosmos.photos.items.create(photoDoc);
 
-    res.json({ message: "Upload successful", photo: photoDoc });
+    res.status(201).json({ message: "Upload successful", photo: photoDoc });
   } catch (err) {
     console.error("UPLOAD ERROR:", err);
-    res.status(500).json({ message: "Upload failed", detail: err?.message || String(err) });
+    res.status(500).json({ message: err.message || "Upload failed" });
   }
 });
 
-// ---- COMMENTS ----
+// ---- Comments (partition key /photoId) ----
 app.get("/api/photos/:photoId/comments", async (req, res) => {
   try {
-    const { comments } = getCosmos();
-    const photoId = req.params.photoId;
+    const cosmos = await verifyAndGetCosmosContainers();
+    const { photoId } = req.params;
 
-    const query = {
-      query:
-        "SELECT c.id, c.photoId, c.author, c.text, c.createdAt FROM c WHERE c.photoId = @photoId ORDER BY c.createdAt DESC",
-      parameters: [{ name: "@photoId", value: photoId }],
-    };
+    const { resources } = await cosmos.comments.items
+      .query({
+        query: "SELECT * FROM c WHERE c.photoId = @photoId ORDER BY c.createdAt DESC",
+        parameters: [{ name: "@photoId", value: photoId }],
+      })
+      .fetchAll();
 
-    const { resources } = await comments.items.query(query).fetchAll();
-    res.json(resources || []);
+    res.json(resources);
   } catch (err) {
-    console.error("GET comments ERROR:", err);
-    res.status(500).json({ message: "Failed to fetch comments", detail: err?.message || String(err) });
+    console.error("GET COMMENTS ERROR:", err);
+    res.status(500).json({ message: err.message || "Failed to get comments" });
   }
 });
 
 app.post("/api/photos/:photoId/comments", async (req, res) => {
   try {
-    const { comments } = getCosmos();
-    const photoId = req.params.photoId;
+    const cosmos = await verifyAndGetCosmosContainers();
+    const { photoId } = req.params;
 
-    const author = (req.body.author || "anonymous").trim();
     const text = (req.body.text || "").trim();
-    if (!text) return res.status(400).json({ message: "Comment text required" });
+    const author = normalizeAuthor(req.body.author);
 
-    const doc = {
+    if (!text) return res.status(400).json({ message: "Comment text is required." });
+
+    const commentDoc = {
       id: uuidv4(),
       photoId,
       author,
@@ -209,85 +246,59 @@ app.post("/api/photos/:photoId/comments", async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    await comments.items.create(doc);
-    res.json({ ok: true, comment: doc });
+    await cosmos.comments.items.create(commentDoc);
+
+    res.status(201).json({ message: "Comment added", comment: commentDoc });
   } catch (err) {
-    console.error("POST comment ERROR:", err);
-    res.status(500).json({ message: "Failed to post comment", detail: err?.message || String(err) });
+    console.error("ADD COMMENT ERROR:", err);
+    res.status(500).json({ message: err.message || "Failed to add comment" });
   }
 });
 
-// ---- RATINGS ----
+// ---- Ratings (partition key /photoId) ----
+app.get("/api/photos/:photoId/ratings", async (req, res) => {
+  try {
+    const cosmos = await verifyAndGetCosmosContainers();
+    const { photoId } = req.params;
+
+    const summary = await getRatingsSummary(cosmos.ratings, photoId);
+    res.json(summary);
+  } catch (err) {
+    console.error("GET RATINGS ERROR:", err);
+    res.status(500).json({ message: err.message || "Failed to get ratings" });
+  }
+});
+
 app.post("/api/photos/:photoId/ratings", async (req, res) => {
   try {
-    const { ratings } = getCosmos();
-    const photoId = req.params.photoId;
+    const cosmos = await verifyAndGetCosmosContainers();
+    const { photoId } = req.params;
 
-    const author = (req.body.author || "anonymous").trim();
-    const ratingValue = Number(req.body.value); // frontend sends { value: 1..5 }
+    const author = normalizeAuthor(req.body.author);
+    const rating = Number(req.body.value);
 
-    if (!Number.isFinite(ratingValue) || ratingValue < 1 || ratingValue > 5) {
-      return res.status(400).json({ message: "Rating value must be 1-5" });
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ message: "Rating value must be an integer 1-5." });
     }
 
-    // ✅ Write BOTH fields:
-    // - ratingValue (safe going forward)
-    // - value (backward compatibility with your existing data)
     const doc = {
-      id: uuidv4(),
+      id: ratingDocId(photoId, author),
       photoId,
       author,
-      ratingValue,
-      value: ratingValue,
+      value: rating, // stored as "value" in the document, that's fine
       createdAt: new Date().toISOString(),
     };
 
-    await ratings.items.create(doc);
-    res.json({ ok: true, rating: doc });
+    await cosmos.ratings.items.upsert(doc);
+
+    const summary = await getRatingsSummary(cosmos.ratings, photoId);
+    res.status(201).json({ message: "Rating saved", ...summary });
   } catch (err) {
-    console.error("POST rating ERROR:", err);
-    res.status(500).json({ message: "Failed to save rating", detail: err?.message || String(err) });
+    console.error("POST RATING ERROR:", err);
+    res.status(500).json({ message: err.message || "Failed to save rating" });
   }
 });
 
-app.get("/api/photos/:photoId/ratings", async (req, res) => {
-  try {
-    const { ratings } = getCosmos();
-    const photoId = req.params.photoId;
-
-    // ✅ Use bracket notation and support BOTH fields.
-    // This avoids Cosmos SQL errors around "value" and keeps old ratings.
-    const query = {
-      query:
-        'SELECT c["ratingValue"] AS ratingValue, c["value"] AS value FROM c WHERE c.photoId = @photoId',
-      parameters: [{ name: "@photoId", value: photoId }],
-    };
-
-    const { resources } = await ratings.items.query(query).fetchAll();
-
-    const values = (resources || [])
-      .map((r) => Number(r.ratingValue ?? r.value))
-      .filter((n) => Number.isFinite(n) && n >= 1 && n <= 5);
-
-    const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-    let sum = 0;
-
-    for (const v of values) {
-      distribution[v] += 1;
-      sum += v;
-    }
-
-    const count = values.length;
-    const average = count ? sum / count : 0;
-
-    res.json({ photoId, average, count, distribution });
-  } catch (err) {
-    console.error("GET ratings ERROR:", err);
-    res.status(500).json({ message: "Failed to fetch ratings", detail: err?.message || String(err) });
-  }
-});
-
-// ---- Start ----
-app.listen(PORT, () => {
-  console.log(`SharePic API running on port ${PORT}`);
-});
+// ---- start ----
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`API listening on port ${port}`));
