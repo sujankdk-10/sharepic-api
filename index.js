@@ -47,7 +47,6 @@ async function verifyAndGetCosmosContainers() {
   const client = new CosmosClient({ endpoint: cfg.endpoint, key: cfg.key });
   const db = client.database(cfg.dbName);
 
-  // Verify DB exists
   await db.read().catch(() => {
     throw new Error(
       `Cosmos database '${cfg.dbName}' not found. Check COSMOS_DB_NAME (must be DB name from Data Explorer).`
@@ -58,15 +57,12 @@ async function verifyAndGetCosmosContainers() {
   const comments = db.container(cfg.commentsContainerName);
   const ratings = db.container(cfg.ratingsContainerName);
 
-  // Verify containers exist
   await photos.read().catch(() => {
     throw new Error(`Cosmos container '${cfg.photosContainerName}' not found in DB '${cfg.dbName}'.`);
   });
-
   await comments.read().catch(() => {
     throw new Error(`Cosmos container '${cfg.commentsContainerName}' not found in DB '${cfg.dbName}'.`);
   });
-
   await ratings.read().catch(() => {
     throw new Error(`Cosmos container '${cfg.ratingsContainerName}' not found in DB '${cfg.dbName}'.`);
   });
@@ -76,14 +72,38 @@ async function verifyAndGetCosmosContainers() {
 
 function normalizeAuthor(author) {
   const a = String(author || "anonymous").trim();
-  // Keep it stable but safe for use in a document id
   return a.replace(/\s+/g, " ").slice(0, 40) || "anonymous";
 }
 
 function ratingDocId(photoId, author) {
-  // Enforce 1 rating per author per photo (upsert will update it)
   const safeAuthor = normalizeAuthor(author).replace(/[^a-zA-Z0-9._-]/g, "_");
   return `${photoId}::${safeAuthor}`;
+}
+
+async function getRatingsSummary(ratingsContainer, photoId) {
+  // ✅ FIX: "value" can trigger Cosmos SQL parse issues; use c["value"]
+  const { resources } = await ratingsContainer.items
+    .query({
+      query: 'SELECT c["value"] AS value FROM c WHERE c.photoId = @photoId',
+      parameters: [{ name: "@photoId", value: photoId }],
+    })
+    .fetchAll();
+
+  const values = (resources || [])
+    .map((r) => Number(r.value))
+    .filter((v) => Number.isFinite(v));
+
+  const count = values.length;
+  const sum = values.reduce((a, b) => a + b, 0);
+  const average = count ? sum / count : 0;
+
+  const dist = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  values.forEach((v) => {
+    const vv = Math.max(1, Math.min(5, Math.round(v)));
+    dist[vv] = (dist[vv] || 0) + 1;
+  });
+
+  return { photoId, average, count, distribution: dist };
 }
 
 // ---- Health ----
@@ -235,38 +255,22 @@ app.post("/api/photos/:photoId/comments", async (req, res) => {
 });
 
 // ---- Ratings (partition key /photoId) ----
-// GET summary for a photo: average + count + distribution
+
+// GET rating summary
 app.get("/api/photos/:photoId/ratings", async (req, res) => {
   try {
     const cosmos = await verifyAndGetCosmosContainers();
     const { photoId } = req.params;
 
-    const { resources } = await cosmos.ratings.items
-      .query({
-        query: "SELECT c.value FROM c WHERE c.photoId = @photoId",
-        parameters: [{ name: "@photoId", value: photoId }],
-      })
-      .fetchAll();
-
-    const values = (resources || []).map(r => Number(r.value)).filter(v => Number.isFinite(v));
-    const count = values.length;
-    const sum = values.reduce((a, b) => a + b, 0);
-    const average = count ? (sum / count) : 0;
-
-    const dist = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-    values.forEach(v => {
-      const vv = Math.max(1, Math.min(5, Math.round(v)));
-      dist[vv] = (dist[vv] || 0) + 1;
-    });
-
-    res.json({ photoId, average, count, distribution: dist });
+    const summary = await getRatingsSummary(cosmos.ratings, photoId);
+    res.json(summary);
   } catch (err) {
     console.error("GET RATINGS ERROR:", err);
     res.status(500).json({ message: err.message || "Failed to get ratings" });
   }
 });
 
-// POST rating (upsert 1 rating per author per photo)
+// POST rating (1 per author per photo via upsert)
 app.post("/api/photos/:photoId/ratings", async (req, res) => {
   try {
     const cosmos = await verifyAndGetCosmosContainers();
@@ -281,7 +285,7 @@ app.post("/api/photos/:photoId/ratings", async (req, res) => {
 
     const doc = {
       id: ratingDocId(photoId, author),
-      photoId, // partition key
+      photoId,
       author,
       value,
       createdAt: new Date().toISOString(),
@@ -289,20 +293,8 @@ app.post("/api/photos/:photoId/ratings", async (req, res) => {
 
     await cosmos.ratings.items.upsert(doc);
 
-    // return updated summary
-    const { resources } = await cosmos.ratings.items
-      .query({
-        query: "SELECT c.value FROM c WHERE c.photoId = @photoId",
-        parameters: [{ name: "@photoId", value: photoId }],
-      })
-      .fetchAll();
-
-    const values = (resources || []).map(r => Number(r.value)).filter(v => Number.isFinite(v));
-    const count = values.length;
-    const sum = values.reduce((a, b) => a + b, 0);
-    const average = count ? (sum / count) : 0;
-
-    res.status(201).json({ message: "Rating saved", photoId, average, count });
+    const summary = await getRatingsSummary(cosmos.ratings, photoId);
+    res.status(201).json({ message: "Rating saved", ...summary });
   } catch (err) {
     console.error("POST RATING ERROR:", err);
     res.status(500).json({ message: err.message || "Failed to save rating" });
