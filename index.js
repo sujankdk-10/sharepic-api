@@ -20,14 +20,10 @@ const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT;
 const COSMOS_KEY = process.env.COSMOS_KEY;
 const COSMOS_DB_NAME = process.env.COSMOS_DB_NAME;
 
-// Photos container envs you already use
 const COSMOS_PHOTOS_CONTAINER = process.env.COSMOS_CONTAINER || "photos";
 const COSMOS_COMMENTS_CONTAINER = process.env.COSMOS_COMMENT_CONTAINER || "comments";
-
-// Ratings container env (make sure this exists in App Service settings)
 const COSMOS_RATINGS_CONTAINER = process.env.COSMOS_RATINGS_CONTAINER || "ratings";
 
-// Creator gate
 const CREATOR_UPLOAD_KEY = process.env.CREATOR_UPLOAD_KEY || "";
 
 // ---- Middleware ----
@@ -41,7 +37,6 @@ app.use(
   })
 );
 
-// Multer in-memory
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ---- Cosmos helpers ----
@@ -76,7 +71,7 @@ function requireCreatorKey(req, res, next) {
   next();
 }
 
-// ---- Health (now checks DB + containers) ----
+// ---- Health (checks DB + containers) ----
 app.get("/api/health", async (req, res) => {
   const info = {
     ok: true,
@@ -99,12 +94,10 @@ app.get("/api/health", async (req, res) => {
 
   try {
     const { db, photos, comments, ratings } = getCosmos();
-
     await db.read();
-    await photos.read();     // <-- verifies container exists
-    await comments.read();   // <-- verifies container exists
-    await ratings.read();    // <-- verifies container exists
-
+    await photos.read();
+    await comments.read();
+    await ratings.read();
     info.cosmosStatus = "OK (DB + containers readable)";
   } catch (e) {
     info.cosmosStatus = "NOT OK: " + (e?.message || String(e));
@@ -258,12 +251,14 @@ app.get("/api/photos/:photoId/ratings", async (req, res) => {
     const { ratings } = getCosmos();
     const photoId = req.params.photoId;
 
+    // ✅ FIX: "value" can break Cosmos SQL parsing. Use bracket notation.
     const query = {
-      query: "SELECT c.value FROM c WHERE c.photoId = @photoId",
+      query: 'SELECT c["value"] AS value FROM c WHERE c.photoId = @photoId',
       parameters: [{ name: "@photoId", value: photoId }],
     };
 
     const { resources } = await ratings.items.query(query).fetchAll();
+
     const values = (resources || [])
       .map((r) => Number(r.value))
       .filter((n) => Number.isFinite(n));
@@ -282,7 +277,6 @@ app.get("/api/photos/:photoId/ratings", async (req, res) => {
     res.json({ photoId, average, count, distribution });
   } catch (err) {
     console.error("GET ratings ERROR:", err);
-    // return the REAL error so your frontend shows it
     res.status(500).json({ message: "Failed to fetch ratings", detail: err?.message || String(err) });
   }
 });
